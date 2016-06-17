@@ -330,14 +330,11 @@ remaining_preflist(Input, Hash, NVal, UsedPreflist) ->
 queue_work_send(#fitting{ref=Ref}=Fitting,
                 Input, Timeout,
                 [{Index,Node}|_]=UsedPreflist) ->
-    try riak_core_vnode_master:command_return_vnode(
-          {Index, Node},
-          #cmd_enqueue{fitting=Fitting, input=Input, timeout=Timeout,
-                       usedpreflist=UsedPreflist},
-          {raw, Ref, self()},
-          riak_pipe_vnode_master) of
+    try riak_core_vnode_master:get_vnode_pid(Node, Index, riak_pipe_vnode) of
         {ok, VnodePid} ->
-            queue_work_wait(Ref, Index, VnodePid);
+            Cmd = #cmd_enqueue{fitting=Fitting, input=Input, timeout=Timeout,
+                usedpreflist=UsedPreflist},
+            sync_send_queue_work(Ref, Cmd,  Index, VnodePid, Node);
         {error, timeout} ->
             {error, {vnode_proxy_timeout, {Index, Node}}}
     catch exit:{{nodedown, Node}, _GenServerCall} ->
@@ -345,45 +342,55 @@ queue_work_send(#fitting{ref=Ref}=Fitting,
             {error, {nodedown, Node}}
     end.
 
-queue_work_wait(Ref, Index, VnodePid) ->
+sync_send_queue_work(Ref, Cmd, Index, VnodePid, Node) ->
     %% monitor in case the vnode is gone before it
     %% responds to this request
     MonRef = erlang:monitor(process, VnodePid),
-    %% block until input confirmed queued, for backpressure
+    Sender = {raw, Ref, self()},
+    case riak_core_vnode_master:command(
+        [{Index, VnodePid}], Cmd, Sender, riak_pipe_vnode_master) of
+        {error, timeout} ->
+            {error, vnode_proxy_timeout, {Index, Node}};
+        _ -> queue_work_wait(Ref, MonRef, Cmd, Node, VnodePid, Index)
+    end.
+
+%% @doc block until input confirmed queued, for backpressure
+queue_work_wait(Ref, MonRef, Cmd, Node, VnodePid, Index) ->
     receive
         {Ref, Reply} ->
             erlang:demonitor(MonRef),
             Reply;
-        {'DOWN', MonRef, process, VnodePid, Reason} when (Reason =:= normal); (Reason =:= noproc) ->
+        {'DOWN', MonRef, process, VnodePid, Reason} when (Reason =:= normal); (Reason =:= noproc)  ->
             %% the vnode likely just shut down after completing handoff
-            {ok, Ring} = riak_core_ring_manager:get_my_ring(),
-            Next = case riak_core_ring:next_owner(Ring, Index) of
-                       {undefined, undefined, undefined} ->
-                           %% ownership finished changing before we asked
-                           %% ... check if Next==Node?
-                           riak_core_ring:index_owner(Ring, Index);
-                       {_From, To, _Status} ->
-                           %% ownership is still changing ... wait for
-                           %% the future owner
-                           To
-                   end,
-            %% monitor new vnode, since the input will be handled
-            %% there, instead of at the vnode originally contacted
-
-            %% On review of this code path, while it's possible
-            %% rpc:call can return {badrpc, _} or throw an error
-            %% exit:_, the supervision tree for riak_pipe_vnode will
-            %% not try and restart the process, so a crash in this
-            %% case is safe.
-            {ok, NextPid} = rpc:call(Next,
-                                     riak_core_vnode_master,
-                                     get_vnode_pid,
-                                     [Index, riak_pipe_vnode]),
-            queue_work_wait(Ref, Index, NextPid);
+            NextPid = get_next_vnode_owner(Index),
+            maybe_resend_and_wait(Node, Cmd, NextPid, Ref, Index, Reason);
         {'DOWN',MonRef,process,VnodePid,Reason} ->
             %% the vnode died unexpectedly
             {error, {vnode_down, Reason}}
     end.
+
+get_next_vnode_owner(Index) ->
+    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+    Next = case riak_core_ring:next_owner(Ring, Index) of
+               {undefined, undefined, undefined} ->
+                   %% ownership finished changing before we asked
+                   %% ... check if Next==Node?
+                   riak_core_ring:index_owner(Ring, Index);
+               {_From, To, _Status} ->
+                   %% ownership is still changing ... wait for
+                   %% the future owner
+                   To
+           end,
+    {ok, NextPid} = riak_core_vnode_master:get_vnode_pid(Next, Index, riak_pipe_vnode),
+    NextPid.
+
+maybe_resend_and_wait(Node, Cmd, NextPid, Ref, Index, _DownReason=noproc) ->
+    lager:info("Resending message due to `noproc` reply"),
+    sync_send_queue_work(Ref, Cmd, Index, NextPid, Node);
+maybe_resend_and_wait(Node, Cmd, NextPid, Ref, Index, _DownReason=normal) ->
+    lager:info("Waiting on new owner, but not resending"),
+    NewMonRef = erlang:monitor(process, NextPid),
+    queue_work_wait(Ref, NewMonRef, Cmd, Node, Index, NextPid).
 
 %% @doc Send end-of-inputs for a fitting to a vnode.  Note: this
 %%      should only be called by `riak_pipe_fitting' processes.  This
